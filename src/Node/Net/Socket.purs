@@ -49,7 +49,7 @@ import Effect.Exception (Error)
 import Effect.Uncurried (EffectFn1, EffectFn2, EffectFn3, EffectFn4, mkEffectFn1, mkEffectFn4, runEffectFn1, runEffectFn2, runEffectFn3)
 import Node.EventEmitter (EventEmitter, EventHandle(..))
 import Node.EventEmitter.UtilTypes (EventHandle0, EventHandle1)
-import Node.Net.Types (ConnectIpcOptions, ConnectTcpOptions, IPC, IpFamily, NewSocketOptions, Socket, SocketReadyState(..), TCP, unsafeFromNodeIpFamily)
+import Node.Net.Types (ConnectIpcOptions, ConnectTcpOptions, IPC, IpFamily, NewSocketOptions, Socket, SocketReadyState(..), TCP, toDuplexImpl, toEventEmitterImpl, unsafeFromNodeIpFamily)
 import Node.Stream (Duplex)
 import Partial.Unsafe (unsafeCrashWith)
 import Prim.Row as Row
@@ -72,10 +72,10 @@ newIpc
 newIpc o = runEffectFn1 newImpl o
 
 toDuplex :: forall connectionType. Socket connectionType -> Duplex
-toDuplex = unsafeCoerce
+toDuplex = toDuplexImpl
 
 toEventEmitter :: forall connectionType. Socket connectionType -> EventEmitter
-toEventEmitter = unsafeCoerce
+toEventEmitter = toEventEmitterImpl
 
 closeH :: forall connectionType. EventHandle1 (Socket connectionType) Boolean
 closeH = EventHandle "close" mkEffectFn1

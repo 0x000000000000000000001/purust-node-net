@@ -10,6 +10,8 @@ module Node.Net.Types
   , TCP
   , IPC
   , Socket
+  , toDuplexImpl
+  , toEventEmitterImpl
   , SocketReadyState(..)
   , socketReadyStateToNode
   , Server
@@ -29,7 +31,9 @@ import Prelude
 
 import Data.Generic.Rep (class Generic)
 import Data.Time.Duration (Milliseconds)
+import Node.EventEmitter (EventEmitter)
 import Node.FS (FileDescriptor)
+import Node.Stream (Duplex)
 import Partial.Unsafe (unsafeCrashWith)
 
 data IpFamily
@@ -92,6 +96,13 @@ socketReadyStateToNode = case _ of
   Open -> "open"
   ReadOnly -> "readOnly"
   WriteOnly -> "writeOnly"
+
+-- | The event-emitter view of a socket or server. The native implementation
+-- | shares one emitter per handle.
+foreign import toEventEmitterImpl :: forall connectionType. Socket connectionType -> EventEmitter
+
+-- | The duplex (stream) view of a socket.
+foreign import toDuplexImpl :: forall connectionType. Socket connectionType -> Duplex
 
 -- | `Server` extends `EventEmitter`
 foreign import data Server :: ConnectionType -> Type
