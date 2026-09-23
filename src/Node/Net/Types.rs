@@ -359,13 +359,39 @@ pub struct ConnectOptions {
     pub keep_alive: bool,
 }
 
+fn socket_allow_half_open(socket: &Rc<Socket>) -> bool {
+    socket_state(socket).lock().unwrap().allow_half_open
+}
+
+/// Shuts down the writable half of the connection (Node's automatic `end` on
+/// peer EOF when `allowHalfOpen` is false).
+fn socket_shutdown_write(socket: &Rc<Socket>) {
+    let fd = socket_state(socket).lock().unwrap().fd;
+    if let Some(fd) = fd {
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_WR);
+        }
+    }
+}
+
 fn start_read_loop(socket: Rc<Socket>, mut reader: TcpStream) {
     let queue = socket_state(&socket).lock().unwrap().queue.clone();
     std::thread::spawn(move || {
         let mut buffer = [0u8; 65536];
         loop {
             match reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    // Node ends the writable side on EOF unless allowHalfOpen is
+                    // set, which also wakes the peer's read loop and releases
+                    // the handle so the process can exit.
+                    if !socket_allow_half_open(&socket) {
+                        socket_shutdown_write(&socket);
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
                 Ok(count) => {
                     {
                         let state = socket_state(&socket);
@@ -638,6 +664,9 @@ fn accepted_socket(
     stream: TcpStream,
     allow_half_open: bool,
 ) -> Rc<Socket> {
+    // BSD/macOS accepted sockets inherit O_NONBLOCK from the listener; the
+    // blocking read loop below expects a blocking stream.
+    let _ = stream.set_nonblocking(false);
     let socket = socket_new_value(queue, error_factory, allow_half_open);
     {
         let state = socket_state(&socket);
