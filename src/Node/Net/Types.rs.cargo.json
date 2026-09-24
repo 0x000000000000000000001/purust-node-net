@@ -1,6 +1,7 @@
 {
   "schema": 1,
   "dependencies": {
-    "libc": { "version": "=0.2.189" }
+    "libc": { "version": "=0.2.189" },
+    "native-tls": { "version": "=0.2.18" }
   }
 }

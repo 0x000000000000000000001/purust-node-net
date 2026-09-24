@@ -3,12 +3,36 @@
 // its net-specific state lives in the stream extension. Background threads only
 // push jobs into the runtime's microtask queue, so every PureScript callback
 // runs on the main thread.
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use native_tls::{TlsAcceptor, TlsConnector, TlsStream};
+
+/// The TLS session of a connection, shared by the read loop and the writers.
+/// Reads use a short timeout so a response can take the lock between attempts.
+pub type TlsWriter = Arc<Mutex<TlsStream<TcpStream>>>;
+
+/// Client-side TLS: `rejectUnauthorized: false` maps to accepting invalid
+/// certificates and hostnames.
+#[derive(Clone)]
+pub struct TlsClientOptions {
+    pub server_name: Option<String>,
+    pub accept_invalid_certs: bool,
+}
+
+/// Reads through the shared TLS writer, locking per call so writes interleave.
+struct TlsReader(TlsWriter);
+
+impl Read for TlsReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut stream = self.0.lock().unwrap();
+        stream.read(buffer)
+    }
+}
 
 use Purs_Node_EventEmitter::{purust_emitter_emit, EventEmitter};
 
@@ -199,6 +223,8 @@ pub struct SocketState {
     pub timeout_ms: Option<i64>,
     pub allow_half_open: bool,
     pub fd: Option<i32>,
+    /// Set when the connection is TLS: writes must go through the session.
+    pub tls_writer: Option<TlsWriter>,
     /// Higher layers (HTTP) attach their per-connection state here.
     pub extension: Option<crate::UnknownType>,
 }
@@ -227,6 +253,7 @@ pub fn socket_new_value(
         timeout_ms: None,
         allow_half_open,
         fd: None,
+        tls_writer: None,
         extension: None,
     }));
     Purs_Node_Stream::purust_stream_set_extension(
@@ -357,6 +384,7 @@ pub struct ConnectOptions {
     pub local_port: Option<u16>,
     pub no_delay: bool,
     pub keep_alive: bool,
+    pub tls: Option<TlsClientOptions>,
 }
 
 fn socket_allow_half_open(socket: &Rc<Socket>) -> bool {
@@ -374,7 +402,7 @@ fn socket_shutdown_write(socket: &Rc<Socket>) {
     }
 }
 
-fn start_read_loop(socket: Rc<Socket>, mut reader: TcpStream) {
+fn start_read_loop<R: Read + Send + Sync + 'static>(socket: Rc<Socket>, mut reader: R) {
     let queue = socket_state(&socket).lock().unwrap().queue.clone();
     std::thread::spawn(move || {
         let mut buffer = [0u8; 65536];
@@ -389,7 +417,11 @@ fn start_read_loop(socket: Rc<Socket>, mut reader: TcpStream) {
                     }
                     break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // TLS reads use a short timeout so writers can interleave.
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 Ok(count) => {
@@ -424,6 +456,56 @@ fn socket_attached_fd(socket: &Rc<Socket>, stream: &TcpStream) {
         }
         Purs_Node_Stream::purust_stream_set_write_fd(socket, duplicated);
     }
+}
+
+fn write_all_fd(fd: i32, bytes: &[u8]) {
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let count = unsafe {
+            libc::write(
+                fd,
+                bytes[written..].as_ptr() as *const libc::c_void,
+                bytes.len() - written,
+            )
+        };
+        if count <= 0 {
+            break;
+        }
+        written += count as usize;
+    }
+}
+
+/// Registers the TLS session of a socket: writes go through it (encrypted),
+/// the duplicated fd is kept for shutdowns only.
+pub fn socket_set_tls_writer(socket: &Rc<Socket>, writer: TlsWriter) {
+    let state = socket_state(socket);
+    state.lock().unwrap().tls_writer = Some(writer);
+}
+
+/// Writes to a socket, through TLS when the connection is secure.
+pub fn socket_write(socket: &Rc<Socket>, bytes: &[u8]) -> bool {
+    let (writer, fd) = {
+        let state = socket_state(socket);
+        let state = state.lock().unwrap();
+        (state.tls_writer.clone(), state.fd)
+    };
+    if let Some(writer) = writer {
+        let mut writer = writer.lock().unwrap();
+        return writer.write_all(bytes).is_ok();
+    }
+    match fd {
+        Some(fd) => {
+            write_all_fd(fd, bytes);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `https.createServer` sets the acceptor before listening.
+pub fn server_set_tls_acceptor(server: &Rc<Server>, acceptor: Rc<TlsAcceptor>) {
+    let state = server_state(server);
+    state.lock().unwrap().tls_acceptor = Some(acceptor);
 }
 
 pub fn socket_connect(socket: Rc<Socket>, options: ConnectOptions) {
@@ -503,6 +585,57 @@ pub fn socket_connect(socket: Rc<Socket>, options: ConnectOptions) {
                         }
                         let local = stream.local_addr().ok();
                         let remote = stream.peer_addr().ok();
+                        // For `https:` the handshake happens before the socket
+                        // reports `connect`, so the request is written over TLS.
+                        let reader: Box<dyn Read + Send + Sync> = match options.tls.as_ref() {
+                            Some(tls) => {
+                                let connector = match TlsConnector::builder()
+                                    .danger_accept_invalid_certs(tls.accept_invalid_certs)
+                                    .danger_accept_invalid_hostnames(tls.accept_invalid_certs)
+                                    .build()
+                                {
+                                    Ok(connector) => connector,
+                                    Err(error) => {
+                                        socket_destroy(
+                                            &socket_for_thread,
+                                            Some(format!("tls connector: {error}")),
+                                        );
+                                        return;
+                                    }
+                                };
+                                let domain = tls
+                                    .server_name
+                                    .clone()
+                                    .unwrap_or_else(|| options.host.clone());
+                                match connector.connect(&domain, stream) {
+                                    Ok(tls_stream) => {
+                                        let raw = tls_stream.get_ref();
+                                        let _ = raw.set_read_timeout(Some(
+                                            std::time::Duration::from_millis(50),
+                                        ));
+                                        let duplicated = unsafe { libc::dup(raw.as_raw_fd()) };
+                                        if duplicated >= 0 {
+                                            let state = socket_state(&socket_for_thread);
+                                            state.lock().unwrap().fd = Some(duplicated);
+                                        }
+                                        let writer: TlsWriter = Arc::new(Mutex::new(tls_stream));
+                                        socket_set_tls_writer(&socket_for_thread, writer.clone());
+                                        Box::new(TlsReader(writer))
+                                    }
+                                    Err(error) => {
+                                        socket_destroy(
+                                            &socket_for_thread,
+                                            Some(format!("TLS handshake failed: {error}")),
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            None => {
+                                socket_attached_fd(&socket_for_thread, &stream);
+                                Box::new(stream)
+                            }
+                        };
                         {
                             let state = socket_state(&socket_for_thread);
                             let mut state = state.lock().unwrap();
@@ -512,13 +645,12 @@ pub fn socket_connect(socket: Rc<Socket>, options: ConnectOptions) {
                             state.pending = false;
                             state.ready_state = "open".to_owned();
                         }
-                        socket_attached_fd(&socket_for_thread, &stream);
                         let target = socket_for_thread.clone();
                         deliver(&queue, move || {
                             purust_emitter_emit(&target, "connect", Vec::new());
                             purust_emitter_emit(&target, "ready", Vec::new());
                         });
-                        start_read_loop(socket_for_thread.clone(), stream);
+                        start_read_loop(socket_for_thread.clone(), reader);
                     }
                     Err(error) => {
                         socket_destroy(
@@ -603,6 +735,7 @@ pub fn socket_options(options: &crate::UnknownType) -> ConnectOptions {
         local_port: option_int(options, "localPort").map(|value| value as u16),
         no_delay: option_bool(options, "noDelay").unwrap_or(false),
         keep_alive: option_bool(options, "keepAlive").unwrap_or(false),
+        tls: None,
     }
 }
 
@@ -622,6 +755,9 @@ pub struct ServerState {
     pub max_connections: i64,
     pub connections: i64,
     pub allow_half_open: bool,
+    /// Set by `https.createServer`: accepted connections are TLS handshaken
+    /// before they become sockets.
+    pub tls_acceptor: Option<Rc<TlsAcceptor>>,
     /// Higher layers (HTTP) attach their per-server state here.
     pub extension: Option<crate::UnknownType>,
 }
@@ -642,6 +778,7 @@ pub fn server_new_value(queue: Option<crate::UnknownType>, error_factory: ErrorF
         max_connections: -1,
         connections: 0,
         allow_half_open: false,
+        tls_acceptor: None,
         extension: None,
     }));
     server.set_user_data(crate::Value::Class(Rc::new(state)));
@@ -679,6 +816,38 @@ fn accepted_socket(
     }
     socket_attached_fd(&socket, &stream);
     start_read_loop(socket.clone(), stream);
+    socket
+}
+
+/// Wraps an accepted TLS session into a socket: the session is shared by the
+/// read loop and `socket_write`, and the raw fd is kept for shutdowns.
+fn accepted_socket_tls(
+    queue: Option<crate::UnknownType>,
+    error_factory: ErrorFactory,
+    tls: TlsStream<TcpStream>,
+    allow_half_open: bool,
+) -> Rc<Socket> {
+    let raw = tls.get_ref();
+    let _ = raw.set_nonblocking(false);
+    // A short read timeout keeps the session lock available to writers.
+    let _ = raw.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+    let duplicated = unsafe { libc::dup(raw.as_raw_fd()) };
+    let socket = socket_new_value(queue, error_factory, allow_half_open);
+    {
+        let state = socket_state(&socket);
+        let mut state = state.lock().unwrap();
+        state.local = raw.local_addr().ok();
+        state.remote = raw.peer_addr().ok();
+        state.connecting = false;
+        state.pending = false;
+        state.ready_state = "open".to_owned();
+        if duplicated >= 0 {
+            state.fd = Some(duplicated);
+        }
+    }
+    let writer: TlsWriter = Arc::new(Mutex::new(tls));
+    socket_set_tls_writer(&socket, writer.clone());
+    start_read_loop(socket.clone(), TlsReader(writer));
     socket
 }
 
@@ -734,12 +903,34 @@ pub fn server_listen(server: &Rc<Server>, host: String, port: u16, backlog: i32,
                     }
                     match listener.accept() {
                         Ok((stream, _peer)) => {
-                            let socket = accepted_socket(
-                                queue.clone(),
-                                error_factory,
-                                stream,
-                                allow_half_open,
-                            );
+                            // BSD/macOS accepted sockets inherit O_NONBLOCK
+                            // from the listener; the handshake and read loop
+                            // expect a blocking stream.
+                            let _ = stream.set_nonblocking(false);
+                            let acceptor = {
+                                let state = server_state(&server_for_accept);
+                                let state = state.lock().unwrap();
+                                state.tls_acceptor.clone()
+                            };
+                            let socket = match acceptor {
+                                Some(acceptor) => match acceptor.accept(stream) {
+                                    Ok(tls) => accepted_socket_tls(
+                                        queue.clone(),
+                                        error_factory,
+                                        tls,
+                                        allow_half_open,
+                                    ),
+                                    // A failed handshake drops the connection,
+                                    // like `tlsClientError` without a listener.
+                                    Err(_) => continue,
+                                },
+                                None => accepted_socket(
+                                    queue.clone(),
+                                    error_factory,
+                                    stream,
+                                    allow_half_open,
+                                ),
+                            };
                             {
                                 let state = server_state(&server_for_accept);
                                 state.lock().unwrap().connections += 1;
